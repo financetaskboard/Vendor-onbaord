@@ -247,35 +247,39 @@ app.get("/api/gmail/scan", async (req, res) => {
 // ─────────────────────────────────────────────
 function extractBody(payload) {
   if (!payload) return "";
-  if (payload.mimeType === "text/plain" && payload.body?.data) {
-    return Buffer.from(payload.body.data, "base64").toString("utf8");
+  function decode(part) {
+    return Buffer.from(part.body.data, "base64").toString("utf8");
   }
-  if (payload.parts) {
-    for (const p of payload.parts) {
-      if (p.mimeType === "text/plain" && p.body?.data)
-        return Buffer.from(p.body.data, "base64").toString("utf8");
-    }
-    for (const p of payload.parts) {
-      if (p.mimeType === "text/html" && p.body?.data) {
-        return Buffer.from(p.body.data, "base64").toString("utf8")
-          .replace(/<\/td>/gi, ": ")
-          .replace(/<br\s*\/?>/gi, "\n")
-          .replace(/<\/tr>/gi, "\n")
-          .replace(/<[^>]+>/g, "")
-          .replace(/&nbsp;/g, " ")
-          .replace(/[ \t]+/g, " ")
-          .replace(/: :/g, ":")
-          .trim();
-      }
-    }
+  function htmlToText(html) {
+    return html
+      .replace(/<\/td>/gi, ": ")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/tr>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/[ \t]+/g, " ")
+      .replace(/: :/g, ":")
+      .trim();
   }
+  function collectParts(p, plains, htmls) {
+    if (!p) return;
+    if (p.mimeType === "text/plain" && p.body?.data) plains.push(decode(p));
+    else if (p.mimeType === "text/html" && p.body?.data) htmls.push(htmlToText(decode(p)));
+    else if (p.parts) p.parts.forEach(c => collectParts(c, plains, htmls));
+  }
+  const plains = [], htmls = [];
+  collectParts(payload, plains, htmls);
+  if (plains.length) { const t = plains.join("\n"); if (t.includes(":")) return t; }
+  if (htmls.length) return htmls.join("\n");
   return "";
 }
 
 function parseVendor(body, reqNum) {
   function field(...patterns) {
     for (const p of patterns) {
-      const re = new RegExp(p + "\\s*[:\\t]+\\s*(.+)", "i");
+      const re = new RegExp(p + "\\s*[:\\t]+\\s*(.+)", "im");
       const m  = body.match(re);
       if (m && m[1].trim() && !m[1].includes("File Upload"))
         return m[1].trim().replace(/\r/g, "");
