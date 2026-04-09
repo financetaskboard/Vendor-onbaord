@@ -258,7 +258,14 @@ function extractBody(payload) {
     for (const p of payload.parts) {
       if (p.mimeType === "text/html" && p.body?.data) {
         return Buffer.from(p.body.data, "base64").toString("utf8")
-          .replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ");
+          .replace(/<\/td>/gi, ": ")
+          .replace(/<br\s*\/?>/gi, "\n")
+          .replace(/<\/tr>/gi, "\n")
+          .replace(/<[^>]+>/g, "")
+          .replace(/&nbsp;/g, " ")
+          .replace(/[ \t]+/g, " ")
+          .replace(/: :/g, ":")
+          .trim();
       }
     }
   }
