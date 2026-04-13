@@ -434,12 +434,18 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
       `Email           : ${vendor.contactEmail || "N/A"}`,
     ].join("\n");
 
+    // Determine MSME type from msmeStatus (Micro / Small / Medium)
+    const msmeTypeRaw = (vendor.msmeStatus || "").toLowerCase();
+    const msmeTypeMap = { micro: "micro", small: "small", medium: "medium" };
+    const msmeType    = msmeTypeMap[msmeTypeRaw] || false;
+
     const createRes = await axios.post(`${url}/web/dataset/call_kw`, {
       ...base, id:2,
       params: {
         model:"res.partner", method:"create",
         args: [{
-          name:                  vendor.companyName,
+          // FIX 1: Company name always stored in UPPERCASE
+          name:                  (vendor.companyName || "").toUpperCase(),
           company_type:          "company",
           is_company:            true,
           supplier_rank:         1,
@@ -453,6 +459,16 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
           vat:                   vendor.gstin             || false,
           l10n_in_gst_treatment: gstType,
           comment:               notes,
+          // FIX 2: PAN number — Indian localisation field
+          l10n_in_pan:           vendor.pan               || false,
+          // FIX 3: MSME fields (Vendor Information tab)
+          // NOTE: verify these technical field names in Settings > Technical > Fields
+          //       if your Odoo uses Studio fields they may be x_studio_msme_*
+          x_studio_msme_status:         vendor.msmeRegistered ? (vendor.msmeStatus || false) : false,
+          x_studio_msme_type:           vendor.msmeRegistered ? (msmeType || false)           : false,
+          x_studio_msme_no:             vendor.msmeRegistered ? (vendor.msmeNo    || false)   : false,
+          // NOTE: No custom draft-state field found on Contact model.
+          //       If you add one via Studio later, set it here.
         }],
         kwargs: {},
       },
@@ -464,11 +480,107 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
     }
 
     const odooId = createRes.data.result;
-    console.log(`✅ Vendor created: ${vendor.companyName} → Odoo ID ${odooId}`);
+    console.log(`✅ Vendor created: ${(vendor.companyName||"").toUpperCase()} → Odoo ID ${odooId}`);
+
+    // FIX 5: Create Bank Account under Accounting tab (res.partner.bank)
+    const bankWarnings = [];
+    if (vendor.accountNumber && vendor.bankName) {
+      try {
+        // Find bank by name, or create it
+        const bankSearch = await axios.post(`${url}/web/dataset/call_kw`, {
+          ...base, id:3,
+          params: {
+            model: "res.bank", method: "search_read",
+            args: [[["name", "ilike", vendor.bankName]]],
+            kwargs: { fields: ["id","name"], limit: 1 },
+          },
+        }, { headers: { Cookie: cookie, "Content-Type":"application/json" } });
+
+        let bankId = false;
+        if (bankSearch.data.result?.length) {
+          bankId = bankSearch.data.result[0].id;
+        } else {
+          const newBank = await axios.post(`${url}/web/dataset/call_kw`, {
+            ...base, id:4,
+            params: {
+              model: "res.bank", method: "create",
+              args: [{ name: vendor.bankName }],
+              kwargs: {},
+            },
+          }, { headers: { Cookie: cookie, "Content-Type":"application/json" } });
+          bankId = newBank.data.result || false;
+        }
+
+        const pbRes = await axios.post(`${url}/web/dataset/call_kw`, {
+          ...base, id:5,
+          params: {
+            model: "res.partner.bank", method: "create",
+            args: [{
+              partner_id:      odooId,
+              acc_number:      vendor.accountNumber,
+              bank_id:         bankId,
+              acc_holder_name: vendor.accountHolderName || false,
+              // IFSC stored in bank name for traceability (l10n_in_ifsc not present in this instance)
+              // Format: "BANK NAME | IFSC: XXXXXX | Branch: YYYY"
+              bank_name: [
+                vendor.bankName,
+                vendor.ifscCode  ? `IFSC: ${vendor.ifscCode}`   : null,
+                vendor.branch    ? `Branch: ${vendor.branch}`   : null,
+              ].filter(Boolean).join(" | ") || false,
+            }],
+            kwargs: {},
+          },
+        }, { headers: { Cookie: cookie, "Content-Type":"application/json" } });
+
+        if (pbRes.data.result) {
+          console.log(`✅ Bank account created: ${vendor.accountNumber} (${vendor.bankName})`);
+        } else {
+          const bErr = pbRes.data.error?.data?.message || "Bank account creation failed";
+          console.warn("⚠ Bank:", bErr);
+          bankWarnings.push(bErr);
+        }
+      } catch (bankErr) {
+        console.warn("⚠ Bank account error:", bankErr.message);
+        bankWarnings.push(bankErr.message);
+      }
+    }
+
+    // FIX 3: Auto-upload Gmail attachments if provided in the request body
+    //  The frontend just needs to pass vendor.attachments[] alongside the vendor data
+    let attachmentResults = [];
+    if (Array.isArray(vendor.attachments) && vendor.attachments.length > 0) {
+      try {
+        const attClient = await getOAuth2Client(req);
+        const attTokens = await storeGet("gmail-tokens");
+        if (attClient && attTokens) {
+          attClient.setCredentials(attTokens);
+          const gmail = google.gmail({ version: "v1", auth: attClient });
+          console.log(`📎 Uploading ${vendor.attachments.length} attachment(s) to Odoo vendor ${odooId}…`);
+          attachmentResults = await uploadAttachmentsToOdoo({
+            gmail,
+            odooUrl: url,
+            cookie,
+            base,
+            odooId,
+            attachments: vendor.attachments,
+          });
+          const ok  = attachmentResults.filter(r => r.ok).length;
+          const bad = attachmentResults.filter(r => !r.ok).length;
+          console.log(`📎 Attachments: ${ok} uploaded, ${bad} failed`);
+        } else {
+          console.warn("⚠ Gmail not connected — skipping attachment upload");
+        }
+      } catch (attErr) {
+        console.warn("⚠ Attachment upload error (vendor still created):", attErr.message);
+      }
+    }
+
     res.json({
       ok: true,
       odooId,
-      odooLink: `${url}/web#id=${odooId}&model=res.partner&view_type=form&cids=1&menu_id=199`,
+      odooLink:          `${url}/web#id=${odooId}&model=res.partner&view_type=form&cids=1&menu_id=199`,
+      bankWarnings:      bankWarnings.length      ? bankWarnings      : undefined,
+      attachmentResults: attachmentResults.length ? attachmentResults : undefined,
     });
 
   } catch (e) {
@@ -479,89 +591,117 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
 
 
 // ─────────────────────────────────────────────
-//  NEW: UPLOAD GMAIL ATTACHMENTS → ODOO VENDOR
-//  POST /api/odoo/upload-attachments
-//  Body: { odooId, attachments: [{messageId, attachmentId, filename, mimeType}] }
+//  SHARED HELPER — download from Gmail + upload to Odoo
+//  FIX 1: adds correct base64 padding (Gmail strips it)
+//  FIX 2: sets maxBodyLength/maxContentLength so large PDFs don't fail
 // ─────────────────────────────────────────────
-app.post("/api/odoo/upload-attachments", async (req, res) => {
-  const cfg         = await storeGet("config") || {};
-  const { odooId, attachments } = req.body;
+async function uploadAttachmentsToOdoo({ gmail, odooUrl, cookie, base, odooId, attachments }) {
+  const results = [];
 
-  if (!odooId || !attachments?.length)
-    return res.status(400).json({ error: "odooId and attachments are required." });
+  for (const att of attachments) {
+    try {
+      console.log(`📎 Downloading: ${att.filename} (msg=${att.messageId})`);
 
-  if (!cfg.odooUrl || !cfg.odooDb || !cfg.odooUsername || !cfg.odooPassword)
-    return res.status(400).json({ error: "Odoo credentials not configured." });
+      // ── Download from Gmail
+      const gmailAtt = await gmail.users.messages.attachments.get({
+        userId: "me",
+        messageId: att.messageId,
+        id: att.attachmentId,
+      });
 
-  try {
-    // ── 1. Get Gmail client
-    const client = await getOAuth2Client(req);
-    const tokens = await storeGet("gmail-tokens");
-    if (!client || !tokens) return res.status(401).json({ error: "Gmail not connected.", authExpired: true });
-    client.setCredentials(tokens);
-    const gmail = google.gmail({ version: "v1", auth: client });
+      // ── FIX 1: Convert URL-safe base64 → standard base64 WITH correct padding
+      //    Gmail omits "=" padding; adding it back prevents Odoo decode errors
+      const raw      = (gmailAtt.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
+      const padded   = raw + "=".repeat((4 - (raw.length % 4)) % 4);
 
-    // ── 2. Authenticate with Odoo
-    const url  = cfg.odooUrl.replace(/\/$/, "");
-    const base = { jsonrpc:"2.0", method:"call" };
-    const authRes = await axios.post(`${url}/web/session/authenticate`, {
-      ...base, id:1,
-      params: { db: cfg.odooDb, login: cfg.odooUsername, password: cfg.odooPassword },
-    });
-    if (!authRes.data.result?.uid) throw new Error("Odoo login failed.");
-    const cookie = authRes.headers["set-cookie"]?.join("; ") || "";
-
-    // ── 3. Download each attachment from Gmail and upload to Odoo
-    const results = [];
-    for (const att of attachments) {
-      try {
-        console.log(`📎 Downloading: ${att.filename} from message ${att.messageId}`);
-
-        // Download from Gmail
-        const gmailAtt = await gmail.users.messages.attachments.get({
-          userId: "me",
-          messageId: att.messageId,
-          id: att.attachmentId,
-        });
-
-        // Gmail returns URL-safe base64; Odoo needs standard base64
-        const base64Data = (gmailAtt.data.data || "")
-          .replace(/-/g, "+")
-          .replace(/_/g, "/");
-
-        // Upload to Odoo as ir.attachment linked to the vendor (res.partner)
-        const uploadRes = await axios.post(`${url}/web/dataset/call_kw`, {
-          ...base, id: Date.now(),
+      // ── Upload to Odoo ir.attachment linked to res.partner
+      const uploadRes = await axios.post(
+        `${odooUrl}/web/dataset/call_kw`,
+        {
+          ...base,
+          id: Date.now(),
           params: {
             model:  "ir.attachment",
             method: "create",
             args: [{
               name:      att.filename,
               type:      "binary",
-              datas:     base64Data,
+              datas:     padded,          // standard base64 with padding
               res_model: "res.partner",
               res_id:    odooId,
-              mimetype:  att.mimeType,
+              mimetype:  att.mimeType || "application/octet-stream",
             }],
             kwargs: {},
           },
-        }, { headers: { Cookie: cookie, "Content-Type": "application/json" } });
-
-        if (uploadRes.data.result) {
-          console.log(`✅ Uploaded: ${att.filename} → Odoo attachment ID ${uploadRes.data.result}`);
-          results.push({ filename: att.filename, ok: true, attachmentId: uploadRes.data.result });
-        } else {
-          const errMsg = uploadRes.data.error?.data?.message || "Upload failed";
-          console.warn(`⚠ Failed: ${att.filename} — ${errMsg}`);
-          results.push({ filename: att.filename, ok: false, error: errMsg });
+        },
+        {
+          headers: { Cookie: cookie, "Content-Type": "application/json" },
+          // FIX 2: allow large files (PDFs can be several MB)
+          maxBodyLength:    Infinity,
+          maxContentLength: Infinity,
         }
-      } catch (attErr) {
-        console.warn(`⚠ Error uploading ${att.filename}:`, attErr.message);
-        results.push({ filename: att.filename, ok: false, error: attErr.message });
-      }
-    }
+      );
 
+      if (uploadRes.data.result) {
+        console.log(`✅ Uploaded: ${att.filename} → Odoo attachment ID ${uploadRes.data.result}`);
+        results.push({ filename: att.filename, ok: true, odooAttachmentId: uploadRes.data.result });
+      } else {
+        const errMsg = uploadRes.data.error?.data?.message || "Odoo returned no result";
+        console.warn(`⚠ Upload failed: ${att.filename} — ${errMsg}`);
+        results.push({ filename: att.filename, ok: false, error: errMsg });
+      }
+
+    } catch (err) {
+      console.warn(`⚠ Error on ${att.filename}:`, err.message);
+      results.push({ filename: att.filename, ok: false, error: err.message });
+    }
+  }
+
+  return results;
+}
+
+
+// ─────────────────────────────────────────────
+//  UPLOAD GMAIL ATTACHMENTS → ODOO VENDOR
+//  POST /api/odoo/upload-attachments
+//  Body: { odooId, attachments: [{messageId, attachmentId, filename, mimeType}] }
+//  FIX 3: standalone endpoint + also called automatically from create-vendor
+// ─────────────────────────────────────────────
+app.post("/api/odoo/upload-attachments", async (req, res) => {
+  const cfg = await storeGet("config") || {};
+  const { odooId, attachments } = req.body;
+
+  if (!odooId || !attachments?.length)
+    return res.status(400).json({ error: "odooId and attachments[] are required." });
+
+  if (!cfg.odooUrl || !cfg.odooDb || !cfg.odooUsername || !cfg.odooPassword)
+    return res.status(400).json({ error: "Odoo credentials not configured." });
+
+  try {
+    // Gmail client
+    const client = await getOAuth2Client(req);
+    const tokens = await storeGet("gmail-tokens");
+    if (!client || !tokens)
+      return res.status(401).json({ error: "Gmail not connected.", authExpired: true });
+    client.setCredentials(tokens);
+    client.on("tokens", async (t) => {
+      await storeSet("gmail-tokens", { ...tokens, ...t });
+    });
+    const gmail = google.gmail({ version: "v1", auth: client });
+
+    // Odoo auth
+    const url  = cfg.odooUrl.replace(/\/$/, "");
+    const base = { jsonrpc: "2.0", method: "call" };
+    const authRes = await axios.post(`${url}/web/session/authenticate`, {
+      ...base, id: 1,
+      params: { db: cfg.odooDb, login: cfg.odooUsername, password: cfg.odooPassword },
+    });
+    if (!authRes.data.result?.uid) throw new Error("Odoo login failed.");
+    const cookie = authRes.headers["set-cookie"]?.join("; ") || "";
+
+    const results = await uploadAttachmentsToOdoo({ gmail, odooUrl: url, cookie, base, odooId, attachments });
     const uploaded = results.filter(r => r.ok).length;
+
     res.json({ ok: true, uploaded, total: results.length, results });
 
   } catch (e) {
