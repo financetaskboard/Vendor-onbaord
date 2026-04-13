@@ -272,8 +272,27 @@ export default function App() {
     try {
       const d = await api.post("/api/odoo/create-vendor", vendor);
       if (d.ok) {
-        setCreated(p => ({ ...p, [reqNum]: { odooId: d.odooId, link: d.odooLink } }));
-        showAlert(`✅ ${vendor.companyName} created in Odoo (ID: ${d.odooId})`, "green", 8000);
+        // Build a detailed result summary
+        const attTotal    = (d.attachmentResults || []).length;
+        const attUploaded = (d.attachmentResults || []).filter(r => r.ok).length;
+        const attFailed   = (d.attachmentResults || []).filter(r => !r.ok);
+        const bankOk      = !d.bankWarnings?.length;
+
+        let msg = `✅ ${vendor.companyName} created in Odoo (ID: ${d.odooId})`;
+        if (attTotal > 0)    msg += ` · 📎 ${attUploaded}/${attTotal} files uploaded`;
+        if (attTotal === 0)  msg += ` · 📎 No attachments found in email`;
+        if (!bankOk)         msg += ` · ⚠ Bank: ${d.bankWarnings[0]}`;
+        if (attFailed.length) msg += ` · ✗ Failed: ${attFailed.map(r=>r.filename).join(", ")}`;
+
+        setCreated(p => ({ ...p, [reqNum]: {
+          odooId: d.odooId,
+          link:   d.odooLink,
+          attUploaded,
+          attTotal,
+          attFailed: attFailed.map(r => r.filename),
+          bankOk,
+        }}));
+        showAlert(msg, attFailed.length || !bankOk ? "amber" : "green", 10000);
       } else {
         throw new Error(d.error || "Unknown error");
       }
@@ -473,6 +492,19 @@ export default function App() {
                                 style={{ fontSize:12, color:"#60a5fa", fontFamily:"'IBM Plex Mono',monospace", display:"inline-flex", alignItems:"center", gap:5 }}>
                                 ⟶ Open vendor in Odoo (ID: {created[v.requestNumber].odooId})
                               </a>
+                              {created[v.requestNumber].attTotal > 0 && (
+                                <div style={{ fontSize:11, color: created[v.requestNumber].attFailed?.length ? "#f59e0b" : "#22c55e", marginTop:6, fontFamily:"'IBM Plex Mono',monospace" }}>
+                                  📎 {created[v.requestNumber].attUploaded}/{created[v.requestNumber].attTotal} attachments uploaded to Odoo
+                                  {created[v.requestNumber].attFailed?.length > 0 && (
+                                    <span style={{ color:"#f87171" }}> · Failed: {created[v.requestNumber].attFailed.join(", ")}</span>
+                                  )}
+                                </div>
+                              )}
+                              {created[v.requestNumber].attTotal === 0 && (
+                                <div style={{ fontSize:11, color:"#5c6178", marginTop:6, fontFamily:"'IBM Plex Mono',monospace" }}>
+                                  📎 No attachments found in email
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
