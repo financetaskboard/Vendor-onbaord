@@ -121,7 +121,6 @@ app.post("/api/config", async (req, res) => {
 //  GMAIL OAUTH2
 // ─────────────────────────────────────────────
 function getAppUrl(req) {
-  // Use env var if set (for Railway deployment), else derive from request
   return process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
 }
 
@@ -176,6 +175,9 @@ app.post("/api/gmail/disconnect", async (req, res) => {
 
 // ─────────────────────────────────────────────
 //  GMAIL SCAN
+//  FIX 1: Search for BOTH "for your review" AND "Complete" emails
+//  FIX 2: fullyApproved = presence of a "Complete" subject email
+//  NEW:   Extract attachment metadata for later upload to Odoo
 // ─────────────────────────────────────────────
 app.get("/api/gmail/scan", async (req, res) => {
   try {
@@ -194,39 +196,58 @@ app.get("/api/gmail/scan", async (req, res) => {
       await storeSet("gmail-tokens", merged);
     });
 
-    const gmail   = google.gmail({ version: "v1", auth: client });
-    const since   = Math.floor((Date.now() - 60 * 24 * 60 * 60 * 1000) / 1000);
-    const subject = cfg.emailSubject || "for your review";
-    const query   = `subject:"${subject}" after:${since}`;
+    const gmail  = google.gmail({ version: "v1", auth: client });
+    const since  = Math.floor((Date.now() - 60 * 24 * 60 * 60 * 1000) / 1000);
+
+    // FIX 1: Also search for "Complete" emails so fully-approved vendors are found
+    const reviewSubject = cfg.emailSubject || "for your review";
+    const query = `(subject:"${reviewSubject}" OR subject:"Complete") after:${since}`;
 
     console.log("Gmail search:", query);
 
-    const listRes = await gmail.users.messages.list({ userId: "me", q: query, maxResults: 100 });
+    const listRes  = await gmail.users.messages.list({ userId: "me", q: query, maxResults: 100 });
     const messages = listRes.data.messages || [];
     console.log("Messages found:", messages.length);
 
     const requestMap = {};
 
     for (const msg of messages) {
-      const full = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "full" });
+      const full    = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "full" });
       const headers = full.data.payload.headers || [];
       const subj    = (headers.find(h => h.name === "Subject") || {}).value || "";
       const date    = (headers.find(h => h.name === "Date")    || {}).value || "";
       const match   = subj.match(/Request\s*#?\s*(\d+)/i);
       if (!match) continue;
-      const reqNum  = match[1];
-      const body    = extractBody(full.data.payload);
+
+      const reqNum     = match[1];
+      const body       = extractBody(full.data.payload);
+      // NEW: collect attachment metadata from this email
+      const attachments = extractAttachments(full.data.payload, msg.id);
+
       if (!requestMap[reqNum]) requestMap[reqNum] = [];
-      requestMap[reqNum].push({ subj, body, date });
+      requestMap[reqNum].push({ subj, body, date, attachments });
     }
 
     const vendors = [];
     for (const [reqNum, emails] of Object.entries(requestMap)) {
       const sorted = emails.sort((a, b) => new Date(a.date) - new Date(b.date));
       const vendor = parseVendor(sorted[0].body, reqNum);
-      vendor.emailCount    = emails.length;
-      vendor.fullyApproved = emails.length >= 2;
-      vendor.latestDate    = sorted[sorted.length - 1].date;
+      vendor.emailCount = emails.length;
+
+      // FIX 2: Approved only when a "Complete" email is actually present
+      vendor.fullyApproved = emails.some(e => /complete/i.test(e.subj));
+
+      vendor.latestDate = sorted[sorted.length - 1].date;
+
+      // NEW: Merge all attachments from every email for this request (dedupe by filename)
+      const allAttachments = emails.flatMap(e => e.attachments || []);
+      const seen = new Set();
+      vendor.attachments = allAttachments.filter(a => {
+        if (seen.has(a.filename)) return false;
+        seen.add(a.filename);
+        return true;
+      });
+
       vendors.push(vendor);
     }
 
@@ -274,6 +295,27 @@ function extractBody(payload) {
   if (plains.length) { const t = plains.join("\n"); if (t.includes(":")) return t; }
   if (htmls.length) return htmls.join("\n");
   return "";
+}
+
+// NEW: Walk Gmail payload and collect all file attachments (ignore inline images)
+function extractAttachments(payload, messageId) {
+  const results = [];
+  function walk(part) {
+    if (!part) return;
+    const filename = part.filename;
+    const attachId = part.body?.attachmentId;
+    if (filename && attachId) {
+      results.push({
+        messageId,
+        attachmentId: attachId,
+        filename,
+        mimeType: part.mimeType || "application/octet-stream",
+      });
+    }
+    if (part.parts) part.parts.forEach(walk);
+  }
+  walk(payload);
+  return results;
 }
 
 function parseVendor(body, reqNum) {
@@ -432,6 +474,101 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
   } catch (e) {
     console.error("Odoo error:", e.message);
     res.status(500).json({ error: e.response?.data?.error?.data?.message || e.message });
+  }
+});
+
+
+// ─────────────────────────────────────────────
+//  NEW: UPLOAD GMAIL ATTACHMENTS → ODOO VENDOR
+//  POST /api/odoo/upload-attachments
+//  Body: { odooId, attachments: [{messageId, attachmentId, filename, mimeType}] }
+// ─────────────────────────────────────────────
+app.post("/api/odoo/upload-attachments", async (req, res) => {
+  const cfg         = await storeGet("config") || {};
+  const { odooId, attachments } = req.body;
+
+  if (!odooId || !attachments?.length)
+    return res.status(400).json({ error: "odooId and attachments are required." });
+
+  if (!cfg.odooUrl || !cfg.odooDb || !cfg.odooUsername || !cfg.odooPassword)
+    return res.status(400).json({ error: "Odoo credentials not configured." });
+
+  try {
+    // ── 1. Get Gmail client
+    const client = await getOAuth2Client(req);
+    const tokens = await storeGet("gmail-tokens");
+    if (!client || !tokens) return res.status(401).json({ error: "Gmail not connected.", authExpired: true });
+    client.setCredentials(tokens);
+    const gmail = google.gmail({ version: "v1", auth: client });
+
+    // ── 2. Authenticate with Odoo
+    const url  = cfg.odooUrl.replace(/\/$/, "");
+    const base = { jsonrpc:"2.0", method:"call" };
+    const authRes = await axios.post(`${url}/web/session/authenticate`, {
+      ...base, id:1,
+      params: { db: cfg.odooDb, login: cfg.odooUsername, password: cfg.odooPassword },
+    });
+    if (!authRes.data.result?.uid) throw new Error("Odoo login failed.");
+    const cookie = authRes.headers["set-cookie"]?.join("; ") || "";
+
+    // ── 3. Download each attachment from Gmail and upload to Odoo
+    const results = [];
+    for (const att of attachments) {
+      try {
+        console.log(`📎 Downloading: ${att.filename} from message ${att.messageId}`);
+
+        // Download from Gmail
+        const gmailAtt = await gmail.users.messages.attachments.get({
+          userId: "me",
+          messageId: att.messageId,
+          id: att.attachmentId,
+        });
+
+        // Gmail returns URL-safe base64; Odoo needs standard base64
+        const base64Data = (gmailAtt.data.data || "")
+          .replace(/-/g, "+")
+          .replace(/_/g, "/");
+
+        // Upload to Odoo as ir.attachment linked to the vendor (res.partner)
+        const uploadRes = await axios.post(`${url}/web/dataset/call_kw`, {
+          ...base, id: Date.now(),
+          params: {
+            model:  "ir.attachment",
+            method: "create",
+            args: [{
+              name:      att.filename,
+              type:      "binary",
+              datas:     base64Data,
+              res_model: "res.partner",
+              res_id:    odooId,
+              mimetype:  att.mimeType,
+            }],
+            kwargs: {},
+          },
+        }, { headers: { Cookie: cookie, "Content-Type": "application/json" } });
+
+        if (uploadRes.data.result) {
+          console.log(`✅ Uploaded: ${att.filename} → Odoo attachment ID ${uploadRes.data.result}`);
+          results.push({ filename: att.filename, ok: true, attachmentId: uploadRes.data.result });
+        } else {
+          const errMsg = uploadRes.data.error?.data?.message || "Upload failed";
+          console.warn(`⚠ Failed: ${att.filename} — ${errMsg}`);
+          results.push({ filename: att.filename, ok: false, error: errMsg });
+        }
+      } catch (attErr) {
+        console.warn(`⚠ Error uploading ${att.filename}:`, attErr.message);
+        results.push({ filename: att.filename, ok: false, error: attErr.message });
+      }
+    }
+
+    const uploaded = results.filter(r => r.ok).length;
+    res.json({ ok: true, uploaded, total: results.length, results });
+
+  } catch (e) {
+    console.error("Attachment upload error:", e.message);
+    const authExpired = e.code === 401 || e.message?.includes("invalid_grant");
+    if (authExpired) await storeDelete("gmail-tokens");
+    res.status(authExpired ? 401 : 500).json({ error: e.message, authExpired });
   }
 });
 
