@@ -347,10 +347,10 @@ function parseVendor(body, reqNum) {
     pan:                field("^PAN"),
     gstFilingFrequency: field("Frequency of filing Return", "Filing Frequency"),
     gstTaxpayerType:    field("Taxpayer Type"),
-    msmeRegistered:     field("Registered under MSME").toLowerCase() === "yes",
-    msmeNo:             field("MSME No\\.?", "MSME Number"),
-    msmeStatus:         field("MSME Status", "MSME Registration Status"),
-    msmeType:           field("MSME Type", "Type of Enterprise", "Type of MSME"),
+    msmeRegistered:     field("Registered under MSME", "MSME Registered", "Is MSME Registered").toLowerCase() === "yes",
+    msmeNo:             field("MSME No\\.?", "MSME Number", "Udyam Registration No\\.?", "Udyam No\\.?", "Udyam Registration Number"),
+    msmeStatus:         field("MSME Status", "MSME Registration Status", "Udyam Status", "Enterprise Status"),
+    msmeType:           field("MSME Type", "Type of Enterprise", "Type of MSME", "Enterprise Type", "Category of Enterprise"),
     bankName:           field("Bank Name"),
     accountHolderName:  field("Account Holder Name"),
     accountNumber:      field("Account Number"),
@@ -474,30 +474,61 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
     const odooId = createRes.data.result;
     console.log(`✅ Vendor created: ${(vendor.companyName||"").toUpperCase()} → Odoo ID ${odooId}`);
 
-    // ── Write MSME fields separately so invalid selection values don't abort creation
+    // ── Write MSME fields: fetch real selection keys first, then match case-insensitively
     if (vendor.msmeRegistered && (vendor.msmeStatus || vendor.msmeNo || vendor.msmeType)) {
       try {
-        // x_studio_msme_status and x_studio_msme_type are Odoo selection fields.
-        // We send the raw parsed values; Odoo will silently ignore unknown keys.
+        // Get actual selection key lists from Odoo for these two fields
+        const fgRes = await axios.post(`${url}/web/dataset/call_kw`, {
+          ...base, id: 10,
+          params: {
+            model: "res.partner", method: "fields_get",
+            args: [["x_studio_msme_status", "x_studio_msme_type"]],
+            kwargs: { attributes: ["selection"] },
+          },
+        }, { headers: { Cookie: cookie, "Content-Type": "application/json" } });
+
+        const fieldDefs = fgRes.data.result || {};
+
+        // Helper: given raw text and field name, return the matching selection key or false
+        function matchSelection(fieldName, rawValue) {
+          if (!rawValue) return false;
+          const options = fieldDefs[fieldName]?.selection || [];
+          const lower   = rawValue.trim().toLowerCase();
+          // Try exact key match first, then label match (case-insensitive)
+          const exact   = options.find(([k]) => k.toLowerCase() === lower);
+          if (exact) return exact[0];
+          const byLabel = options.find(([, lbl]) => lbl.toLowerCase() === lower);
+          if (byLabel) return byLabel[0];
+          // Partial label match as last resort
+          const partial = options.find(([, lbl]) => lbl.toLowerCase().includes(lower) || lower.includes(lbl.toLowerCase()));
+          return partial ? partial[0] : false;
+        }
+
         const msmeWrite = {};
-        // Send the raw parsed values — Odoo will accept matching selection keys
-        if (vendor.msmeStatus) msmeWrite.x_studio_msme_status = vendor.msmeStatus;
-        if (vendor.msmeType)   msmeWrite.x_studio_msme_type   = vendor.msmeType;   // e.g. "Small"
-        if (vendor.msmeNo)     msmeWrite.x_studio_msme_no     = vendor.msmeNo;
+        const statusKey = matchSelection("x_studio_msme_status", vendor.msmeStatus);
+        const typeKey   = matchSelection("x_studio_msme_type",   vendor.msmeType);
+        if (statusKey)       msmeWrite.x_studio_msme_status = statusKey;
+        if (typeKey)         msmeWrite.x_studio_msme_type   = typeKey;
+        if (vendor.msmeNo)   msmeWrite.x_studio_msme_no     = vendor.msmeNo;
+
+        console.log(`MSME raw → status:"${vendor.msmeStatus}"→"${statusKey}", type:"${vendor.msmeType}"→"${typeKey}", no:"${vendor.msmeNo}"`);
+        console.log("Available status options:", JSON.stringify(fieldDefs["x_studio_msme_status"]?.selection));
+        console.log("Available type options:",   JSON.stringify(fieldDefs["x_studio_msme_type"]?.selection));
 
         if (Object.keys(msmeWrite).length) {
           await axios.post(`${url}/web/dataset/call_kw`, {
-            ...base, id: 10,
+            ...base, id: 11,
             params: {
               model: "res.partner", method: "write",
               args: [[odooId], msmeWrite],
               kwargs: {},
             },
           }, { headers: { Cookie: cookie, "Content-Type": "application/json" } });
-          console.log("✅ MSME fields written:", JSON.stringify(msmeWrite));
+          console.log("✅ MSME written:", JSON.stringify(msmeWrite));
+        } else {
+          console.warn("⚠ No MSME keys matched — raw values:", { status: vendor.msmeStatus, type: vendor.msmeType });
         }
       } catch (msmeErr) {
-        // Non-fatal — vendor was already created
         console.warn("⚠ MSME write failed (vendor still created):", msmeErr.message);
       }
     }
@@ -560,34 +591,39 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
       }
     }
 
-    // FIX 3: Auto-upload Gmail attachments if provided in the request body
-    //  The frontend just needs to pass vendor.attachments[] alongside the vendor data
+    // ── Auto-upload Gmail attachments
     let attachmentResults = [];
+    console.log(`📎 vendor.attachments received: ${JSON.stringify((vendor.attachments||[]).map(a=>a.filename))}`);
     if (Array.isArray(vendor.attachments) && vendor.attachments.length > 0) {
       try {
         const attClient = await getOAuth2Client(req);
         const attTokens = await storeGet("gmail-tokens");
         if (attClient && attTokens) {
           attClient.setCredentials(attTokens);
+          // Refresh token silently
+          attClient.on("tokens", async (t) => { await storeSet("gmail-tokens", { ...attTokens, ...t }); });
           const gmail = google.gmail({ version: "v1", auth: attClient });
-          console.log(`📎 Uploading ${vendor.attachments.length} attachment(s) to Odoo vendor ${odooId}…`);
+          console.log(`📎 Starting upload of ${vendor.attachments.length} file(s) → Odoo ID ${odooId}`);
           attachmentResults = await uploadAttachmentsToOdoo({
-            gmail,
-            odooUrl: url,
-            cookie,
-            base,
-            odooId,
+            gmail, odooUrl: url, cookie, base, odooId,
             attachments: vendor.attachments,
           });
           const ok  = attachmentResults.filter(r => r.ok).length;
           const bad = attachmentResults.filter(r => !r.ok).length;
-          console.log(`📎 Attachments: ${ok} uploaded, ${bad} failed`);
+          console.log(`📎 Done: ${ok} uploaded, ${bad} failed`);
+          if (bad > 0) {
+            attachmentResults.filter(r => !r.ok).forEach(r => console.warn(`  ✗ ${r.filename}: ${r.error}`));
+          }
         } else {
           console.warn("⚠ Gmail not connected — skipping attachment upload");
+          attachmentResults = [{ filename: "all", ok: false, error: "Gmail not connected on server" }];
         }
       } catch (attErr) {
         console.warn("⚠ Attachment upload error (vendor still created):", attErr.message);
+        attachmentResults = [{ filename: "all", ok: false, error: attErr.message }];
       }
+    } else {
+      console.log("📎 No attachments in vendor payload — nothing to upload");
     }
 
     res.json({
