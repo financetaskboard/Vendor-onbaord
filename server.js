@@ -348,8 +348,9 @@ function parseVendor(body, reqNum) {
     gstFilingFrequency: field("Frequency of filing Return", "Filing Frequency"),
     gstTaxpayerType:    field("Taxpayer Type"),
     msmeRegistered:     field("Registered under MSME").toLowerCase() === "yes",
-    msmeNo:             field("MSME No\\.?"),
-    msmeStatus:         field("MSME Status"),
+    msmeNo:             field("MSME No\\.?", "MSME Number"),
+    msmeStatus:         field("MSME Status", "MSME Registration Status"),
+    msmeType:           field("MSME Type", "Type of Enterprise", "Type of MSME"),
     bankName:           field("Bank Name"),
     accountHolderName:  field("Account Holder Name"),
     accountNumber:      field("Account Number"),
@@ -434,11 +435,6 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
       `Email           : ${vendor.contactEmail || "N/A"}`,
     ].join("\n");
 
-    // Determine MSME type from msmeStatus (Micro / Small / Medium)
-    const msmeTypeRaw = (vendor.msmeStatus || "").toLowerCase();
-    const msmeTypeMap = { micro: "micro", small: "small", medium: "medium" };
-    const msmeType    = msmeTypeMap[msmeTypeRaw] || false;
-
     const createRes = await axios.post(`${url}/web/dataset/call_kw`, {
       ...base, id:2,
       params: {
@@ -461,12 +457,8 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
           comment:               notes,
           // FIX 2: PAN number — Indian localisation field
           l10n_in_pan:           vendor.pan               || false,
-          // FIX 3: MSME fields (Vendor Information tab)
-          // NOTE: verify these technical field names in Settings > Technical > Fields
-          //       if your Odoo uses Studio fields they may be x_studio_msme_*
-          x_studio_msme_status:         vendor.msmeRegistered ? (vendor.msmeStatus || false) : false,
-          x_studio_msme_type:           vendor.msmeRegistered ? (msmeType || false)           : false,
-          x_studio_msme_no:             vendor.msmeRegistered ? (vendor.msmeNo    || false)   : false,
+          // NOTE: MSME fields are written in a separate call below (after vendor is created)
+          //       so that invalid selection values don't crash the whole create.
           // NOTE: No custom draft-state field found on Contact model.
           //       If you add one via Studio later, set it here.
         }],
@@ -481,6 +473,34 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
 
     const odooId = createRes.data.result;
     console.log(`✅ Vendor created: ${(vendor.companyName||"").toUpperCase()} → Odoo ID ${odooId}`);
+
+    // ── Write MSME fields separately so invalid selection values don't abort creation
+    if (vendor.msmeRegistered && (vendor.msmeStatus || vendor.msmeNo || vendor.msmeType)) {
+      try {
+        // x_studio_msme_status and x_studio_msme_type are Odoo selection fields.
+        // We send the raw parsed values; Odoo will silently ignore unknown keys.
+        const msmeWrite = {};
+        // Send the raw parsed values — Odoo will accept matching selection keys
+        if (vendor.msmeStatus) msmeWrite.x_studio_msme_status = vendor.msmeStatus;
+        if (vendor.msmeType)   msmeWrite.x_studio_msme_type   = vendor.msmeType;   // e.g. "Small"
+        if (vendor.msmeNo)     msmeWrite.x_studio_msme_no     = vendor.msmeNo;
+
+        if (Object.keys(msmeWrite).length) {
+          await axios.post(`${url}/web/dataset/call_kw`, {
+            ...base, id: 10,
+            params: {
+              model: "res.partner", method: "write",
+              args: [[odooId], msmeWrite],
+              kwargs: {},
+            },
+          }, { headers: { Cookie: cookie, "Content-Type": "application/json" } });
+          console.log("✅ MSME fields written:", JSON.stringify(msmeWrite));
+        }
+      } catch (msmeErr) {
+        // Non-fatal — vendor was already created
+        console.warn("⚠ MSME write failed (vendor still created):", msmeErr.message);
+      }
+    }
 
     // FIX 5: Create Bank Account under Accounting tab (res.partner.bank)
     const bankWarnings = [];
@@ -520,13 +540,8 @@ app.post("/api/odoo/create-vendor", async (req, res) => {
               acc_number:      vendor.accountNumber,
               bank_id:         bankId,
               acc_holder_name: vendor.accountHolderName || false,
-              // IFSC stored in bank name for traceability (l10n_in_ifsc not present in this instance)
-              // Format: "BANK NAME | IFSC: XXXXXX | Branch: YYYY"
-              bank_name: [
-                vendor.bankName,
-                vendor.ifscCode  ? `IFSC: ${vendor.ifscCode}`   : null,
-                vendor.branch    ? `Branch: ${vendor.branch}`   : null,
-              ].filter(Boolean).join(" | ") || false,
+              // Note: l10n_in_ifsc not present in this Odoo instance.
+              // IFSC + Branch are already stored in the partner's Internal Notes.
             }],
             kwargs: {},
           },
